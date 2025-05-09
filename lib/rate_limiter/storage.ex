@@ -4,7 +4,8 @@ defmodule RL.Storage do
   require Logger
 
   @crdt RL.Storage.Crdt
-  @default_window 1000
+  @default_window 10_000
+  @default_limit 5
 
   # Client API
 
@@ -16,19 +17,27 @@ defmodule RL.Storage do
     GenServer.start_link(__MODULE__, Map.new(config), name: __MODULE__)
   end
 
-  def allow(key, window \\ @default_window) do
+  def allow(key, window \\ @default_window, limit \\ @default_limit) do
     now = System.monotonic_time(:millisecond)
 
     case DeltaCrdt.get(@crdt, {:storage, key}) do
       nil ->
-        DeltaCrdt.put(@crdt, {:storage, key}, now)
+        # First request for this key
+        DeltaCrdt.put(@crdt, {:storage, key}, {now, 1})
         :ok
 
-      last_time when now - last_time >= window ->
-        DeltaCrdt.put(@crdt, {:storage, key}, now)
+      {last_time, _count} when now - last_time >= window ->
+        # Window has expired, reset counter
+        DeltaCrdt.put(@crdt, {:storage, key}, {now, 1})
+        :ok
+
+      {last_time, count} when count < limit ->
+        # Within window and under limit, increment counter
+        DeltaCrdt.put(@crdt, {:storage, key}, {last_time, count + 1})
         :ok
 
       _ ->
+        # Either window hasn't expired or limit reached
         {:error, :rate_limited}
     end
   end

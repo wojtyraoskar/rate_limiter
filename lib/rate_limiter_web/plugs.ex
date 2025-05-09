@@ -2,8 +2,9 @@ defmodule RLWeb.Plugs.UserMinuteLimiterPlug do
   import Plug.Conn
   @behaviour Plug
 
-  # … per 60 seconds
+  # 5 requests per 60 seconds
   @window_ms 60_000
+  @request_limit 5
 
   @impl Plug
   def init(opts), do: opts
@@ -18,7 +19,7 @@ defmodule RLWeb.Plugs.UserMinuteLimiterPlug do
         |> halt()
 
       id ->
-        case RL.Storage.allow({:user, id}, @window_ms) do
+        case RL.Storage.allow({:user, id}, @window_ms, @request_limit) do
           :ok ->
             conn
 
@@ -36,14 +37,16 @@ defmodule RLWeb.Plugs.RateLimiterPlug do
   import Plug.Conn
   @behaviour Plug
 
+  # 5 requests per 60 seconds
   @window_ms 60_000
+  @request_limit 5
 
   @impl Plug
   def init(opts), do: opts
 
   @impl Plug
   def call(conn, _opts) do
-    case RL.Storage.allow(conn.cookies["_rate_limiter_key"], @window_ms) do
+    case RL.Storage.allow(conn.cookies["_rate_limiter_key"], @window_ms, @request_limit) do
       :ok ->
         conn
 

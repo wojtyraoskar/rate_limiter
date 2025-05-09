@@ -11,7 +11,7 @@ defmodule RLWeb.Router do
   end
 
   pipeline :user_rate_limiter do
-    # ⬅ 1 user req / min
+    # ⬅ 1 user req / min
     plug RLWeb.Plugs.UserMinuteLimiterPlug
   end
 
@@ -30,6 +30,7 @@ defmodule RLWeb.Router do
     pipe_through [:browser, :user_rate_limiter]
 
     get "/user", PageController, :user_home
+    get "/user_home", PageController, :user_home
   end
 
   # Enable LiveDashboard and Swoosh mailbox preview in development
