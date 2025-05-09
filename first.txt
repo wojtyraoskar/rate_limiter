@@ -1,0 +1,152 @@
+# lib/my_app/rate_limiter.ex
+#---------------------------------------------------------------------
+# A **very small** but fully‑working distributed sliding‑window rate
+# limiter built only with Elixir/Erlang std‑lib.  It keeps counters in
+# ETS and synchronises updates across *all* nodes in a BEAM cluster via
+# `:global.trans/3`, so three Kubernetes pods (or more) share a single
+# limit budget.
+#
+# ⚠️  Educational quality.  Enough for a GitHub showcase, but for very
+#     high QPS use REDIS/Hammer or similar.
+#---------------------------------------------------------------------
+
+defmodule RL.RL do
+  use GenServer
+
+  @moduledoc """
+  Distributed sliding‑window rate limiter (token‑bucket‑ish).
+
+  ## Public API
+
+      iex> RL.RL.allow?(:global, 20)
+      :ok | {:error, :rate_limited}
+
+  * `key`     – anything: `{:user, user_id}` for per‑user, or `:global`.
+  * `limit`   – max events in the window.
+  * `window`  – window size (ms), default 1000 ms.
+  """
+
+  @window 1_000
+  @table  __MODULE__
+
+  # ------------------------------------------------------------------
+  # Client
+  # ------------------------------------------------------------------
+  @spec allow?(term(), pos_integer(), pos_integer()) :: :ok | {:error, :rate_limited}
+  def allow?(key, limit, window \\ @window) when limit > 0 do
+    now = System.monotonic_time(:millisecond)
+
+    :global.trans({__MODULE__, key}, fn ->
+      {count, ts} = bucket(key)
+
+      cond do
+        count < limit ->
+          put_bucket(key, {count + 1, ts})
+          :ok
+
+        now - ts >= window ->
+          put_bucket(key, {1, now})
+          :ok
+
+        true ->
+          {:error, :rate_limited}
+      end
+    end, :infinity)
+  end
+
+  # ------------------------------------------------------------------
+  # Server – only used to own the ETS table so it lives with the app.
+  # ------------------------------------------------------------------
+  @impl true
+  def init(_), do: {:ok, :ets.new(@table, [:named_table, :public, read_concurrency: true])}
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+
+  # ------------------------------------------------------------------
+  # Internal helpers
+  # ------------------------------------------------------------------
+  defp bucket(key) do
+    case :ets.lookup(@table, key) do
+      [{^key, c, ts}] -> {c, ts}
+      _ -> {0, System.monotonic_time(:millisecond)}
+    end
+  end
+
+  defp put_bucket(key, {c, ts}), do: :ets.insert(@table, {key, c, ts})
+end
+
+# lib/my_app_web/plugs/rate_limiter_plug.ex
+#---------------------------------------------------------------------
+# Simple Plug wrapper so the limiter can be dropped into a Phoenix or
+# Plug.Router pipeline.
+#---------------------------------------------------------------------
+
+defmodule RLWeb.Plugs.RLPlug do
+  import Plug.Conn
+  @behaviour Plug
+
+  @impl Plug
+  def init(opts), do: opts
+
+  @impl Plug
+  def call(conn, opts) do
+    key_fun = Keyword.get(opts, :key, &global_key/1)
+    limit   = Keyword.fetch!(opts, :limit)
+    window  = Keyword.get(opts, :window, 1_000)
+
+    case RL.RL.allow?(key_fun.(conn), limit, window) do
+      :ok -> conn
+      {:error, _} ->
+        conn
+        |> put_resp_header("retry-after", "1")
+        |> send_resp(429, "Too Many Requests")
+        |> halt()
+    end
+  end
+
+  # Default: global limiter – one quota shared by *everybody*.
+  defp global_key(_conn), do: :global
+end
+
+# lib/my_app/application.ex (excerpt)
+#---------------------------------------------------------------------
+# Supervision tree – ensure limiter and clustering start early.
+#---------------------------------------------------------------------
+
+children = [
+  # Distributed limiter ETS owner
+  {RL.RL, []},
+
+  # Cluster discovery (libcluster) so your 3 pods talk to each other
+  {Cluster.Supervisor, [Application.get_env(:my_app, :topologies), [name: RL.ClusterSupervisor]]},
+
+  # … the rest of your children (Endpoint, Repo, etc.)
+]
+
+# config/runtime.exs (excerpt)
+#---------------------------------------------------------------------
+# Minimal libcluster gossip setup for Kubernetes headless svc
+#---------------------------------------------------------------------
+config :my_app, :topologies, [
+  k8s_gossip: [
+    strategy: Cluster.Strategy.Kubernetes.DNS,
+    config: [
+      service: "RL-headless",
+      application_name: "RL",
+      polling_interval: 5_000
+    ]
+  ]
+]
+
+# router.ex (excerpt)
+#---------------------------------------------------------------------
+# Example use: 20 rps per user, otherwise fall back to global bucket.
+#---------------------------------------------------------------------
+plug RLWeb.Plugs.RLPlug,
+  limit: 20,
+  key: fn conn ->
+    case conn.assigns[:current_user] do
+      %{id: id} -> {:user, id}
+      _ -> :global
+    end
+  end
